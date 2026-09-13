@@ -308,10 +308,10 @@ phase_passive() {
         local created;   created=$( (grep -iE "creation date|created:" "${out}/whois.txt" 2>/dev/null || true) | head -1 | awk -F: '{print $2}' | xargs)
         local expires;   expires=$( (grep -iE "expiry date|expir" "${out}/whois.txt" 2>/dev/null || true) | head -1 | awk -F: '{print $2}' | xargs)
         local registrant;registrant=$( (grep -iE "registrant name|registrant org" "${out}/whois.txt" 2>/dev/null || true) | head -1 | awk -F: '{print $2}' | xargs)
-        [[ -n "$registrar" ]]  && finding INFO "Registrar"  "$registrar"
-        [[ -n "$created" ]]    && finding INFO "Domain Created" "$created"
-        [[ -n "$expires" ]]    && finding INFO "Domain Expires" "$expires"
-        [[ -n "$registrant" ]] && finding INFO "Registrant" "$registrant"
+        if [[ -n "$registrar" ]];  then finding INFO "Registrar"  "$registrar"; fi
+        if [[ -n "$created" ]];    then finding INFO "Domain Created" "$created"; fi
+        if [[ -n "$expires" ]];    then finding INFO "Domain Expires" "$expires"; fi
+        if [[ -n "$registrant" ]]; then finding INFO "Registrant" "$registrant"; fi
     fi
 
     # ── DNS RECORDS ───────────────────────────────────────────────────────────
@@ -331,7 +331,9 @@ phase_passive() {
 
     # Capture A records for later use
     mapfile -t IP_LIST < <( (dig +short A "$TARGET" 2>/dev/null || true) | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
-    [[ ${#IP_LIST[@]} -gt 0 ]] && finding INFO "Resolved IPs" "${IP_LIST[*]}"
+    if [[ ${#IP_LIST[@]} -gt 0 ]]; then
+        finding INFO "Resolved IPs" "${IP_LIST[*]}"
+    fi
 
     # SPF / DMARC checks
     local spf; spf=$( (dig +short TXT "$TARGET" 2>/dev/null || true) | grep -i "v=spf" || true)
@@ -655,7 +657,9 @@ phase_ports() {
             local service; service=$(echo "$line" | awk '{print $3}')
             local version; version=$(echo "$line" | cut -d' ' -f4-)
 
-            [[ "$state" != "open" ]] && continue
+            if [[ "$state" != "open" ]]; then
+                continue
+            fi
 
             # Flag sensitive ports
             case "$port" in
@@ -687,8 +691,9 @@ phase_ports() {
         done < <( (grep "^[0-9]" "${out}/nmap_tcp.txt" 2>/dev/null || true) | grep "open" 2>/dev/null || true)
 
         local open_count=${#OPEN_PORTS[@]}
-        [[ $open_count -gt 20 ]] && \
+        if [[ $open_count -gt 20 ]]; then
             finding HIGH "Large Attack Surface" "$open_count open ports detected — review and close unnecessary services"
+        fi
     fi
 }
 
@@ -868,9 +873,10 @@ phase_web() {
             -Format txt \
             -nointeractive 2>/dev/null || true
         if [[ -f "${out}/nikto.txt" ]]; then
-            local nikto_findings; nikto_findings=$(grep "^+" "${out}/nikto.txt" | wc -l)
-            [[ $nikto_findings -gt 0 ]] && \
+            local nikto_findings; nikto_findings=$(grep "^+" "${out}/nikto.txt" 2>/dev/null | wc -l || echo 0)
+            if [[ $nikto_findings -gt 0 ]]; then
                 finding HIGH "Nikto Web Vulnerabilities" "$nikto_findings issues found — review ${out}/nikto.txt"
+            fi
         fi
         success "Nikto scan complete"
     fi
@@ -904,10 +910,10 @@ phase_vulns() {
             local n_high; n_high=$(grep -c "\[high\]"     "${out}/nuclei_results.txt" 2>/dev/null || echo 0)
             local n_med;  n_med=$(grep -c "\[medium\]"    "${out}/nuclei_results.txt" 2>/dev/null || echo 0)
             local n_low;  n_low=$(grep -c "\[low\]"       "${out}/nuclei_results.txt" 2>/dev/null || echo 0)
-            [[ $n_crit -gt 0 ]] && finding CRITICAL "Nuclei Critical"  "$n_crit critical issues found"
-            [[ $n_high -gt 0 ]] && finding HIGH    "Nuclei High"      "$n_high high-severity issues found"
-            [[ $n_med  -gt 0 ]] && finding MEDIUM  "Nuclei Medium"    "$n_med medium issues found"
-            [[ $n_low  -gt 0 ]] && finding LOW     "Nuclei Low"       "$n_low low-severity issues found"
+            if [[ $n_crit -gt 0 ]]; then finding CRITICAL "Nuclei Critical" "$n_crit critical issues found"; fi
+            if [[ $n_high -gt 0 ]]; then finding HIGH    "Nuclei High"     "$n_high high-severity issues found"; fi
+            if [[ $n_med  -gt 0 ]]; then finding MEDIUM  "Nuclei Medium"   "$n_med medium issues found"; fi
+            if [[ $n_low  -gt 0 ]]; then finding LOW     "Nuclei Low"      "$n_low low-severity issues found"; fi
         fi
         success "Nuclei scan complete"
     fi
@@ -1657,10 +1663,10 @@ print_summary() {
     echo -e "  ${BOLD}Output:${NC}       ${OUTPUT_DIR}/"
     echo ""
     echo -e "  ${BOLD}FINDINGS SUMMARY:${NC}"
-    [[ $FINDINGS_CRITICAL -gt 0 ]] && echo -e "    ${RED}●  CRITICAL : ${FINDINGS_CRITICAL}${NC}"
-    [[ $FINDINGS_HIGH     -gt 0 ]] && echo -e "    ${RED}●  HIGH     : ${FINDINGS_HIGH}${NC}"
-    [[ $FINDINGS_MEDIUM   -gt 0 ]] && echo -e "    ${YELLOW}●  MEDIUM   : ${FINDINGS_MEDIUM}${NC}"
-    [[ $FINDINGS_LOW      -gt 0 ]] && echo -e "    ${CYAN}●  LOW      : ${FINDINGS_LOW}${NC}"
+    if [[ $FINDINGS_CRITICAL -gt 0 ]]; then echo -e "    ${RED}●  CRITICAL : ${FINDINGS_CRITICAL}${NC}"; fi
+    if [[ $FINDINGS_HIGH     -gt 0 ]]; then echo -e "    ${RED}●  HIGH     : ${FINDINGS_HIGH}${NC}"; fi
+    if [[ $FINDINGS_MEDIUM   -gt 0 ]]; then echo -e "    ${YELLOW}●  MEDIUM   : ${FINDINGS_MEDIUM}${NC}"; fi
+    if [[ $FINDINGS_LOW      -gt 0 ]]; then echo -e "    ${CYAN}●  LOW      : ${FINDINGS_LOW}${NC}"; fi
     echo -e "    ${WHITE}●  INFO     : ${FINDINGS_INFO}${NC}"
     echo ""
     echo -e "  ${BOLD}ARTIFACTS:${NC}"
@@ -1669,10 +1675,12 @@ print_summary() {
     echo -e "    ${DIM}Port scans    :${NC}  ${OUTPUT_DIR}/ports/"
     echo -e "    ${DIM}Web recon     :${NC}  ${OUTPUT_DIR}/web/"
     echo -e "    ${DIM}Vulns         :${NC}  ${OUTPUT_DIR}/vulns/"
-    [[ "$REPORT_FORMAT" != "json" ]] && \
+    if [[ "$REPORT_FORMAT" != "json" ]]; then
         echo -e "    ${GREEN}HTML Report   :${NC}  ${OUTPUT_DIR}/reports/report.html"
-    [[ "$REPORT_FORMAT" != "html" ]] && \
+    fi
+    if [[ "$REPORT_FORMAT" != "html" ]]; then
         echo -e "    ${GREEN}JSON Report   :${NC}  ${OUTPUT_DIR}/reports/report.json"
+    fi
     echo -e "    ${DIM}Full log      :${NC}  ${OUTPUT_DIR}/recon.log"
     echo ""
     echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
