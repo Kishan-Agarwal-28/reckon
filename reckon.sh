@@ -166,7 +166,7 @@ EOF
 #  ARGUMENT PARSING
 # ─────────────────────────────────────────────────────────────────────────────
 parse_args() {
-    [[ $# -eq 0 ]] && { usage; }
+    if [[ $# -eq 0 ]]; then usage; fi
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -t|--target)          TARGET="$2";         shift 2 ;;
@@ -359,13 +359,14 @@ phase_passive() {
 
     # Zone transfer attempt
     info "Attempting DNS zone transfer..."
-    local ns_list; mapfile -t ns_list < <(dig +short NS "$TARGET" 2>/dev/null)
-    for ns in "${ns_list[@]}"; do
+    local ns_list=(); mapfile -t ns_list < <(dig +short NS "$TARGET" 2>/dev/null || true)
+    for ns in "${ns_list[@]:-}"; do
+        if [[ -z "$ns" ]]; then continue; fi
         ns=$(echo "$ns" | sed 's/\.$//')
         if dig AXFR "$TARGET" "@${ns}" 2>/dev/null | grep -q "Transfer failed\|XFR size" ; then
             : # no transfer
         else
-            local zt; zt=$(dig AXFR "$TARGET" "@${ns}" 2>/dev/null)
+            local zt; zt=$(dig AXFR "$TARGET" "@${ns}" 2>/dev/null || true)
             if echo "$zt" | grep -vq "Transfer failed"; then
                 echo "$zt" > "${out}/zone_transfer_${ns}.txt"
                 finding CRITICAL "DNS Zone Transfer Allowed" "Nameserver $ns allows AXFR — full zone exposed"
@@ -377,11 +378,11 @@ phase_passive() {
     if [[ ${#IP_LIST[@]} -gt 0 ]]; then
         info "ASN & IP reputation lookup..."
         for ip in "${IP_LIST[@]}"; do
-            local asn_info; asn_info=$(curl -s --max-time 10 "https://ipinfo.io/${ip}/json" 2>/dev/null)
+            local asn_info; asn_info=$(curl -s --max-time 10 "https://ipinfo.io/${ip}/json" 2>/dev/null || true)
             if [[ -n "$asn_info" ]]; then
                 echo "$asn_info" > "${out}/asn_${ip}.json"
-                local org; org=$(echo "$asn_info" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('org','N/A'))" 2>/dev/null)
-                local country; country=$(echo "$asn_info" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('country','N/A'))" 2>/dev/null)
+                local org; org=$(echo "$asn_info" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('org','N/A'))" 2>/dev/null || echo "N/A")
+                local country; country=$(echo "$asn_info" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('country','N/A'))" 2>/dev/null || echo "N/A")
                 finding INFO "IP Info ($ip)" "Org: $org | Country: $country"
             fi
         done
@@ -390,7 +391,7 @@ phase_passive() {
     # ── SSL/TLS CERTIFICATE RECON ─────────────────────────────────────────────
     info "SSL/TLS certificate transparency lookup..."
     local crt_data; crt_data=$(curl -s --max-time 15 \
-        "https://crt.sh/?q=%.${TARGET}&output=json" 2>/dev/null)
+        "https://crt.sh/?q=%.${TARGET}&output=json" 2>/dev/null || true)
     if [[ -n "$crt_data" ]]; then
         echo "$crt_data" > "${out}/crt_sh.json"
         local cert_domains; cert_domains=$(echo "$crt_data" | \
@@ -432,16 +433,18 @@ except: pass
             local expiry; expiry=$( (openssl x509 -noout -enddate < "$ssl_out" 2>/dev/null || true) | cut -d= -f2)
             if [[ -n "$expiry" ]]; then
                 local exp_epoch; exp_epoch=$(date -d "$expiry" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$expiry" +%s 2>/dev/null || echo 0)
-                local now_epoch; now_epoch=$(date +%s)
-                local days_left=$(( (exp_epoch - now_epoch) / 86400 ))
-                if [[ $days_left -lt 0 ]]; then
-                    finding CRITICAL "SSL Certificate Expired" "Certificate expired $((days_left * -1)) days ago"
-                elif [[ $days_left -lt 14 ]]; then
-                    finding HIGH "SSL Certificate Expiring Soon" "Expires in $days_left days"
-                elif [[ $days_left -lt 30 ]]; then
-                    finding MEDIUM "SSL Certificate Expiring" "Expires in $days_left days"
-                else
-                    finding INFO "SSL Certificate Valid" "Expires in $days_left days ($expiry)"
+                if [[ -n "$exp_epoch" && "$exp_epoch" =~ ^-?[0-9]+$ && "$exp_epoch" -gt 0 ]]; then
+                    local now_epoch; now_epoch=$(date +%s)
+                    local days_left=$(( (exp_epoch - now_epoch) / 86400 ))
+                    if [[ $days_left -lt 0 ]]; then
+                        finding CRITICAL "SSL Certificate Expired" "Certificate expired $((days_left * -1)) days ago"
+                    elif [[ $days_left -lt 14 ]]; then
+                        finding HIGH "SSL Certificate Expiring Soon" "Expires in $days_left days"
+                    elif [[ $days_left -lt 30 ]]; then
+                        finding MEDIUM "SSL Certificate Expiring" "Expires in $days_left days"
+                    else
+                        finding INFO "SSL Certificate Valid" "Expires in $days_left days ($expiry)"
+                    fi
                 fi
             fi
 
@@ -601,24 +604,25 @@ phase_subdomains() {
             mapfile -t LIVE_HOSTS < <(awk '{print $1}' "${out}/live_http_subdomains.txt")
         fi
     fi
+    return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  PHASE 3 — PORT SCANNING
 # ─────────────────────────────────────────────────────────────────────────────
 phase_ports() {
-    [[ "$SKIP_ACTIVE" == "true" ]] && { info "Skipping active port scanning (--skip-active)"; return; }
+    if [[ "$SKIP_ACTIVE" == "true" ]]; then info "Skipping active port scanning (--skip-active)"; return 0; fi
     section "PHASE 3 — Port Scanning & Service Detection"
     local out="${OUTPUT_DIR}/ports"
 
     local nmap_speed="-T${NMAP_SPEED}"
-    [[ "$STEALTH_MODE" == "true" ]] && nmap_speed="-T1 -f --data-length 25"
+    if [[ "$STEALTH_MODE" == "true" ]]; then nmap_speed="-T1 -f --data-length 25"; fi
 
     local port_arg="-p ${PORTS}"
-    [[ "$FULL_PORT_SCAN" == "true" ]] && port_arg="-p-"
+    if [[ "$FULL_PORT_SCAN" == "true" ]]; then port_arg="-p-"; fi
 
     local target_ip="${TARGET}"
-    [[ ${#IP_LIST[@]} -gt 0 ]] && target_ip="${IP_LIST[0]}"
+    if [[ ${#IP_LIST[@]} -gt 0 ]]; then target_ip="${IP_LIST[0]}"; fi
 
     # ── Quick discovery scan ───────────────────────────────────────────────────
     info "Initial host discovery..."
@@ -688,20 +692,21 @@ phase_ports() {
                 27017)finding CRITICAL "MongoDB Open"    "Port 27017/MongoDB — likely unauthenticated" ;;
                 *)    finding INFO   "Port $port Open"   "$service — $version" ;;
             esac
-        done < <( (grep "^[0-9]" "${out}/nmap_tcp.txt" 2>/dev/null || true) | grep "open" 2>/dev/null || true)
+        done < <( (grep "^[0-9]" "${out}/nmap_tcp.txt" 2>/dev/null || true) | (grep "open" 2>/dev/null || true) )
 
         local open_count=${#OPEN_PORTS[@]}
         if [[ $open_count -gt 20 ]]; then
             finding HIGH "Large Attack Surface" "$open_count open ports detected — review and close unnecessary services"
         fi
     fi
+    return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  PHASE 4 — WEB RECONNAISSANCE
 # ─────────────────────────────────────────────────────────────────────────────
 phase_web() {
-    [[ "$SKIP_ACTIVE" == "true" ]] && { info "Skipping web recon (--skip-active)"; return; }
+    if [[ "$SKIP_ACTIVE" == "true" ]]; then info "Skipping web recon (--skip-active)"; return 0; fi
     section "PHASE 4 — Web Application Reconnaissance"
     local out="${OUTPUT_DIR}/web"
 
@@ -715,7 +720,7 @@ phase_web() {
         # ── HTTP Headers ──────────────────────────────────────────────────────
         local headers; headers=$(curl -s -I --max-time "$TIMEOUT" \
             -A "Mozilla/5.0 (compatible; SecurityAudit/1.0)" \
-            -L "$url" 2>/dev/null)
+            -L "$url" 2>/dev/null || true)
 
         if [[ -n "$headers" ]]; then
             echo "$headers" > "${out}/headers_${url_safe}.txt"
@@ -745,13 +750,17 @@ phase_web() {
 
             # Cookie flags
             local cookies; cookies=$(echo "$headers" | grep -i "Set-Cookie:" 2>/dev/null || true)
-            if echo "$cookies" | grep -qi "Set-Cookie" && \
-               ! echo "$cookies" | grep -qi "HttpOnly"; then
-                finding HIGH "Cookie Missing HttpOnly" "Session cookies lack HttpOnly flag on $url"
+            local _has_setcookie=false
+            if echo "$cookies" | grep -qi "Set-Cookie" 2>/dev/null; then
+                _has_setcookie=true
             fi
-            if echo "$cookies" | grep -qi "Set-Cookie" && \
-               ! echo "$cookies" | grep -qi "Secure"; then
-                finding HIGH "Cookie Missing Secure Flag" "Cookies lack Secure flag on $url"
+            if [[ "$_has_setcookie" == "true" ]]; then
+                if ! echo "$cookies" | grep -qi "HttpOnly" 2>/dev/null; then
+                    finding HIGH "Cookie Missing HttpOnly" "Session cookies lack HttpOnly flag on $url"
+                fi
+                if ! echo "$cookies" | grep -qi "Secure" 2>/dev/null; then
+                    finding HIGH "Cookie Missing Secure Flag" "Cookies lack Secure flag on $url"
+                fi
             fi
 
             # Check redirect HTTP → HTTPS
@@ -818,7 +827,7 @@ phase_web() {
                                "clientaccesspolicy.xml" "security.txt" ".well-known/security.txt")
         for file in "${sensitive_files[@]}"; do
             local code; code=$(curl -s -o /dev/null -w "%{http_code}" \
-                --max-time 5 "${url}/${file}" 2>/dev/null)
+                --max-time 5 "${url}/${file}" 2>/dev/null || echo "000")
             if [[ "$code" =~ ^(200|206)$ ]]; then
                 case "$file" in
                     .git/HEAD|.env*|*.bak|*.sql|*.zip|*.tar.gz)
@@ -847,13 +856,13 @@ phase_web() {
                 -o "${out}/ffuf_dirs.json" \
                 -of json \
                 -s 2>/dev/null || true
-            [[ -f "${out}/ffuf_dirs.json" ]] && {
+            if [[ -f "${out}/ffuf_dirs.json" ]]; then
                 local dir_count; dir_count=$(python3 -c \
                     "import json; d=json.load(open('${out}/ffuf_dirs.json')); print(len(d.get('results',[])))" 2>/dev/null || echo 0)
                 if [[ $dir_count -gt 0 ]]; then
                     finding MEDIUM "Directories Found" "$dir_count paths discovered via brute-force"
                 fi
-            }
+            fi
         elif [[ "${TOOL_STATUS[gobuster]:-missing}" == "available" ]]; then
             timeout 300 gobuster dir \
                 -u "https://${TARGET}" \
@@ -873,20 +882,21 @@ phase_web() {
             -Format txt \
             -nointeractive 2>/dev/null || true
         if [[ -f "${out}/nikto.txt" ]]; then
-            local nikto_findings; nikto_findings=$(grep "^+" "${out}/nikto.txt" 2>/dev/null | wc -l || echo 0)
-            if [[ $nikto_findings -gt 0 ]]; then
+            local nikto_findings; nikto_findings=$( (grep "^+" "${out}/nikto.txt" 2>/dev/null || true) | wc -l)
+            if [[ -n "$nikto_findings" && "$nikto_findings" -gt 0 ]]; then
                 finding HIGH "Nikto Web Vulnerabilities" "$nikto_findings issues found — review ${out}/nikto.txt"
             fi
         fi
         success "Nikto scan complete"
     fi
+    return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  PHASE 5 — VULNERABILITY CORRELATION
 # ─────────────────────────────────────────────────────────────────────────────
 phase_vulns() {
-    [[ "$SKIP_ACTIVE" == "true" ]] && return
+    if [[ "$SKIP_ACTIVE" == "true" ]]; then return 0; fi
     section "PHASE 5 — Vulnerability Correlation"
     local out="${OUTPUT_DIR}/vulns"
 
@@ -895,7 +905,7 @@ phase_vulns() {
         info "Running Nuclei template scan (this may take a while)..."
         local nuclei_targets=("https://${TARGET}")
         # Add live subdomains
-        [[ ${#LIVE_HOSTS[@]} -gt 0 ]] && nuclei_targets+=("${LIVE_HOSTS[@]}")
+        if [[ ${#LIVE_HOSTS[@]} -gt 0 ]]; then nuclei_targets+=("${LIVE_HOSTS[@]}"); fi
 
         printf '%s\n' "${nuclei_targets[@]}" > "${out}/nuclei_targets.txt"
         timeout 600 nuclei \
@@ -906,10 +916,14 @@ phase_vulns() {
             -rate-limit "$RATE_LIMIT" 2>/dev/null || true
 
         if [[ -f "${out}/nuclei_results.txt" && -s "${out}/nuclei_results.txt" ]]; then
-            local n_crit; n_crit=$(grep -c "\[critical\]" "${out}/nuclei_results.txt" 2>/dev/null || echo 0)
-            local n_high; n_high=$(grep -c "\[high\]"     "${out}/nuclei_results.txt" 2>/dev/null || echo 0)
-            local n_med;  n_med=$(grep -c "\[medium\]"    "${out}/nuclei_results.txt" 2>/dev/null || echo 0)
-            local n_low;  n_low=$(grep -c "\[low\]"       "${out}/nuclei_results.txt" 2>/dev/null || echo 0)
+            local n_crit; n_crit=$( (grep -c "\[critical\]" "${out}/nuclei_results.txt" 2>/dev/null || true) )
+            local n_high; n_high=$( (grep -c "\[high\]"     "${out}/nuclei_results.txt" 2>/dev/null || true) )
+            local n_med;  n_med=$( (grep -c "\[medium\]"    "${out}/nuclei_results.txt" 2>/dev/null || true) )
+            local n_low;  n_low=$( (grep -c "\[low\]"       "${out}/nuclei_results.txt" 2>/dev/null || true) )
+            if [[ -z "$n_crit" ]]; then n_crit=0; fi
+            if [[ -z "$n_high" ]]; then n_high=0; fi
+            if [[ -z "$n_med"  ]]; then n_med=0;  fi
+            if [[ -z "$n_low"  ]]; then n_low=0;  fi
             if [[ $n_crit -gt 0 ]]; then finding CRITICAL "Nuclei Critical" "$n_crit critical issues found"; fi
             if [[ $n_high -gt 0 ]]; then finding HIGH    "Nuclei High"     "$n_high high-severity issues found"; fi
             if [[ $n_med  -gt 0 ]]; then finding MEDIUM  "Nuclei Medium"   "$n_med medium issues found"; fi
@@ -943,7 +957,7 @@ phase_vulns() {
             fi
             # IIS
             if echo "$line" | grep -qiE "IIS/[1-9]\.[0-9]"; then
-                local iis_ver; iis_ver=$(echo "$line" | grep -oiE "IIS/[0-9]+\.[0-9]+")
+                local iis_ver; iis_ver=$( (echo "$line" | grep -oiE "IIS/[0-9]+\.[0-9]+" 2>/dev/null || true) | head -1)
                 finding MEDIUM "IIS Detected" "$iis_ver — verify patches are applied"
             fi
             # vsFTPd
@@ -973,6 +987,7 @@ phase_vulns() {
         finding MEDIUM "Clickjacking Vulnerability" \
             "No X-Frame-Options or CSP frame-ancestors directive set"
     fi
+    return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -991,7 +1006,7 @@ nvd_search() {
 
     local curl_args=(-s --max-time 20
         "${api_url}?keywordSearch=${encoded_kw}&resultsPerPage=${max_results}")
-    [[ -n "$NVD_API_KEY" ]] && curl_args+=(-H "apiKey: ${NVD_API_KEY}")
+    if [[ -n "$NVD_API_KEY" ]]; then curl_args+=(-H "apiKey: ${NVD_API_KEY}"); fi
 
     local raw; raw=$(curl "${curl_args[@]}" 2>/dev/null || true)
     printf '%s' "$raw"
@@ -1155,8 +1170,8 @@ PYEOF
 
 # ── Main CVE phase ─────────────────────────────────────────────────────────────
 phase_cve() {
-    [[ "$SKIP_CVE"    == "true" ]] && { info "Skipping CVE lookup (--skip-cve)"; return; }
-    [[ "$SKIP_ACTIVE" == "true" ]] && return
+    if [[ "$SKIP_CVE" == "true" ]]; then info "Skipping CVE lookup (--skip-cve)"; return 0; fi
+    if [[ "$SKIP_ACTIVE" == "true" ]]; then return 0; fi
 
     section "PHASE 5b — CVE Lookup & Exploit Correlation"
     local out="${OUTPUT_DIR}/vulns"
@@ -1188,7 +1203,7 @@ phase_cve() {
             local version; version=$(echo "$line" | awk '{$1=$2=$3=""; print $0}' | sed 's/^[[:space:]]*//')
 
             # Skip empty or generic versions
-            [[ -z "$version" || "$version" == *"?"* ]] && continue
+            if [[ -z "$version" || "$version" == *"?"* ]]; then continue; fi
 
             # Build clean product+version string for searches
             local search_term=""
@@ -1222,17 +1237,17 @@ phase_cve() {
                     search_term="Windows RDP" ;;
                 smb|netbios-ssn|microsoft-ds)
                     search_term=$(echo "$version" | grep -oiE "Samba [0-9]+\.[0-9.]+" | head -1 || true)
-                    [[ -z "$search_term" ]] && search_term="SMB Windows" ;;
+                    if [[ -z "$search_term" ]]; then search_term="SMB Windows"; fi ;;
                 vnc)
                     search_term="VNC RealVNC" ;;
                 telnet)
                     search_term="telnet" ;;
                 redis)
                     search_term=$(echo "$version" | grep -oiE "Redis [0-9]+\.[0-9.]+" | head -1 || true)
-                    [[ -z "$search_term" ]] && search_term="Redis" ;;
+                    if [[ -z "$search_term" ]]; then search_term="Redis"; fi ;;
                 mongodb)
                     search_term=$(echo "$version" | grep -oiE "MongoDB [0-9]+\.[0-9.]+" | head -1 || true)
-                    [[ -z "$search_term" ]] && search_term="MongoDB" ;;
+                    if [[ -z "$search_term" ]]; then search_term="MongoDB"; fi ;;
                 postgresql)
                     search_term=$(echo "$version" | grep -oiE "PostgreSQL [0-9]+\.[0-9.]+" | head -1 || true) ;;
                 *)
@@ -1255,7 +1270,7 @@ phase_cve() {
                 local already=false
                 if [[ ${#DETECTED_SERVICES[@]} -gt 0 ]]; then
                     for existing in "${DETECTED_SERVICES[@]}"; do
-                        [[ "$existing" == "$search_term" ]] && already=true && break
+                        if [[ "$existing" == "$search_term" ]]; then already=true; break; fi
                     done
                 fi
                 if [[ "$already" == "false" ]]; then
@@ -1267,8 +1282,8 @@ phase_cve() {
     done < "${OUTPUT_DIR}/ports/nmap_tcp.txt"
 
     # Also add nmap OS detection result if available
-    local os_guess; os_guess=$(grep -i "OS details\|Running:" "${OUTPUT_DIR}/ports/nmap_tcp.txt" \
-        2>/dev/null | head -2 | awk -F: '{print $2}' | xargs || true)
+    local os_guess; os_guess=$( (grep -i "OS details\|Running:" "${OUTPUT_DIR}/ports/nmap_tcp.txt" \
+        2>/dev/null || true) | head -2 | awk -F: '{print $2}' | xargs || true)
     if [[ -n "$os_guess" ]]; then
         info "OS detected: $os_guess"
         finding INFO "OS Fingerprint" "$os_guess"
@@ -1368,18 +1383,16 @@ PYEOF
         # Additional targeted searches based on whatweb / nikto findings
         local web_techs=()
         for f in "${OUTPUT_DIR}/web"/whatweb_*.txt; do
-            [[ -f "$f" ]] || continue
+            if [[ ! -f "$f" ]]; then continue; fi
             # Extract tech names from whatweb output
             while IFS= read -r tech_line; do
                 for tech in WordPress Drupal Joomla Laravel Django Rails Struts \
                             Tomcat WebLogic JBoss Jenkins Confluence phpMyAdmin \
                             Grafana Kibana Splunk Roundcube Zimbra; do
                     if echo "$tech_line" | grep -qi "$tech"; then
-                        local ver; ver=$(echo "$tech_line" | \
-                            grep -oiE "${tech}[^,\]]*" | head -1 | \
-                            grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | head -1 || true)
+                        local ver; ver=$( (echo "$tech_line" | (grep -oiE "${tech}[^,\]]*" 2>/dev/null || true) | head -1 | (grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" 2>/dev/null || true) | head -1) || true)
                         local tech_search="$tech"
-                        [[ -n "$ver" ]] && tech_search="$tech $ver"
+                        if [[ -n "$ver" ]]; then tech_search="$tech $ver"; fi
                         web_techs+=("$tech_search")
                     fi
                 done
@@ -1392,7 +1405,7 @@ PYEOF
         fi
 
         for wt in "${web_techs[@]:-}"; do
-            [[ -z "$wt" ]] && continue
+            if [[ -z "$wt" ]]; then continue; fi
             info "  searchsploit → $wt (web tech)"
             run_searchsploit "$wt" "$cve_report"
             sleep 1
@@ -1418,7 +1431,7 @@ PYEOF
             local already_done=false
             if [[ ${#DETECTED_SERVICES[@]} -gt 0 ]]; then
                 for done_svc in "${DETECTED_SERVICES[@]}"; do
-                    [[ "${done_svc,,}" == *"${bt,,}"* ]] && already_done=true && break
+                    if [[ "${done_svc,,}" == *"${bt,,}"* ]]; then already_done=true; break; fi
                 done
             fi
             if [[ "$already_done" == "false" ]]; then
@@ -1507,6 +1520,7 @@ PYEOF
         finding CRITICAL "Exploitable Services Detected" \
             "$TOTAL_EXPLOITS_FOUND public exploit(s) found across all detected services — IMMEDIATE review required"
     fi
+    return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1681,6 +1695,7 @@ ${findings_rows}
 HTMLEOF
         success "HTML report: ${html_file}"
     fi
+    return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1733,11 +1748,11 @@ main() {
     setup_output
 
     log "Starting recon against: ${BOLD}${TARGET}${NC}"
-    [[ "$STEALTH_MODE"    == "true" ]] && warn "Stealth mode enabled — scans will be slower"
-    [[ "$FULL_PORT_SCAN"  == "true" ]] && warn "Full port scan enabled — scanning all 65535 ports"
-    [[ "$SKIP_ACTIVE"     == "true" ]] && warn "Active scanning disabled — passive only"
-    [[ "$SKIP_BRUTEFORCE" == "true" ]] && warn "Brute-force disabled"
-    [[ "$SKIP_CVE"        == "true" ]] && warn "CVE & exploit lookup disabled"
+    if [[ "$STEALTH_MODE"    == "true" ]]; then warn "Stealth mode enabled — scans will be slower"; fi
+    if [[ "$FULL_PORT_SCAN"  == "true" ]]; then warn "Full port scan enabled — scanning all 65535 ports"; fi
+    if [[ "$SKIP_ACTIVE"     == "true" ]]; then warn "Active scanning disabled — passive only"; fi
+    if [[ "$SKIP_BRUTEFORCE" == "true" ]]; then warn "Brute-force disabled"; fi
+    if [[ "$SKIP_CVE"        == "true" ]]; then warn "CVE & exploit lookup disabled"; fi
 
     check_tools
     phase_passive
