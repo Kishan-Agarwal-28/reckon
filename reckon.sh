@@ -43,11 +43,14 @@ FULL_PORT_SCAN=false
 REPORT_FORMAT="both"    # html | json | both
 VERBOSE=false
 
+AUTO_CONFIRM=false
+
 # Runtime state
 declare -A TOOL_STATUS   # tracks which tools are available
-declare -a OPEN_PORTS
-declare -a SUBDOMAINS
-declare -a LIVE_HOSTS
+declare -a OPEN_PORTS=()
+declare -a SUBDOMAINS=()
+declare -a LIVE_HOSTS=()
+declare -a IP_LIST=()
 FINDINGS_CRITICAL=0
 FINDINGS_HIGH=0
 FINDINGS_MEDIUM=0
@@ -56,10 +59,10 @@ FINDINGS_INFO=0
 JSON_FINDINGS="[]"
 
 # CVE / Exploit tracking
-declare -a DETECTED_SERVICES   # "product:version" pairs extracted from nmap
-JSON_CVE_RESULTS="[]"          # aggregated CVE records for reporting
+declare -a DETECTED_SERVICES=()   # "product:version" pairs extracted from nmap
+JSON_CVE_RESULTS="[]"              # aggregated CVE records for reporting
 TOTAL_EXPLOITS_FOUND=0
-NVD_API_KEY=""                 # optional — set via --nvd-key for higher rate limits
+NVD_API_KEY=""                     # optional — set via --nvd-key for higher rate limits
 SKIP_CVE=false
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -70,7 +73,7 @@ info()     { echo -e "${CYAN}[INFO]${NC}  $*"; }
 success()  { echo -e "${GREEN}[✓]${NC}    $*"; }
 warn()     { echo -e "${YELLOW}[!]${NC}    $*"; }
 error()    { echo -e "${RED}[✗]${NC}    $*" >&2; }
-debug()    { [[ "$VERBOSE" == "true" ]] && echo -e "${DIM}[DBG]   $*${NC}"; }
+debug()    { if [[ "$VERBOSE" == "true" ]]; then echo -e "${DIM}[DBG]   $*${NC}"; fi; }
 section()  { echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; \
              echo -e "${BOLD}${MAGENTA}  ► $*${NC}"; \
              echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; }
@@ -78,23 +81,26 @@ finding()  {
     local severity="$1"; local title="$2"; local detail="$3"
     local color="$NC"
     case "$severity" in
-        CRITICAL) color="$RED";    ((FINDINGS_CRITICAL++)) ;;
-        HIGH)     color="$RED";    ((FINDINGS_HIGH++))     ;;
-        MEDIUM)   color="$YELLOW"; ((FINDINGS_MEDIUM++))   ;;
-        LOW)      color="$CYAN";   ((FINDINGS_LOW++))      ;;
-        INFO)     color="$WHITE";  ((FINDINGS_INFO++))     ;;
+        CRITICAL) color="$RED";    FINDINGS_CRITICAL=$((FINDINGS_CRITICAL + 1)) ;;
+        HIGH)     color="$RED";    FINDINGS_HIGH=$((FINDINGS_HIGH + 1))     ;;
+        MEDIUM)   color="$YELLOW"; FINDINGS_MEDIUM=$((FINDINGS_MEDIUM + 1))   ;;
+        LOW)      color="$CYAN";   FINDINGS_LOW=$((FINDINGS_LOW + 1))      ;;
+        INFO)     color="$WHITE";  FINDINGS_INFO=$((FINDINGS_INFO + 1))     ;;
     esac
     echo -e "${color}[${severity}]${NC} ${BOLD}${title}${NC}: ${detail}"
     # Append to JSON findings
     local escaped_detail; escaped_detail=$(echo "$detail" | sed 's/"/\\"/g' | tr -d '\n')
     local escaped_title;  escaped_title=$(echo "$title"  | sed 's/"/\\"/g' | tr -d '\n')
-    JSON_FINDINGS=$(echo "$JSON_FINDINGS" | \
-        python3 -c "
+    JSON_FINDINGS=$(python3 -c "
 import sys, json
-arr = json.load(sys.stdin)
-arr.append({'severity':'${severity}','title':'${escaped_title}','detail':'${escaped_detail}','ts':'$(date -Iseconds)'})
+try:
+    arr = json.loads(sys.argv[1])
+except Exception:
+    arr = []
+arr.append({'severity': sys.argv[2], 'title': sys.argv[3], 'detail': sys.argv[4], 'ts': '$(date -Iseconds)'})
 print(json.dumps(arr))
-" 2>/dev/null || echo "$JSON_FINDINGS")
+" "$JSON_FINDINGS" "$severity" "$escaped_title" "$escaped_detail" 2>/dev/null || echo "$JSON_FINDINGS")
+    return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -138,6 +144,7 @@ ${BOLD}OPTIONS:${NC}
   -w, --wordlist <file>       Directory bruteforce wordlist
   -d, --dns-wordlist <file>   DNS subdomain wordlist
   -r, --report <fmt>          Report format: html|json|both (default: both)
+  -y, --yes                   Skip interactive confirmation prompt
       --skip-active           Skip active scanning (passive recon only)
       --skip-bruteforce       Skip directory/DNS bruteforce
       --skip-cve              Skip NVD CVE & Exploit-DB lookups
@@ -171,6 +178,7 @@ parse_args() {
             -w|--wordlist)        WORDLIST="$2";       shift 2 ;;
             -d|--dns-wordlist)    DNS_WORDLIST="$2";   shift 2 ;;
             -r|--report)          REPORT_FORMAT="$2";  shift 2 ;;
+            -y|--yes)             AUTO_CONFIRM=true;   shift   ;;
                --skip-active)     SKIP_ACTIVE=true;        shift   ;;
                --skip-bruteforce) SKIP_BRUTEFORCE=true;    shift   ;;
                --skip-cve)        SKIP_CVE=true;           shift   ;;
@@ -180,13 +188,19 @@ parse_args() {
             *) error "Unknown option: $1"; usage ;;
         esac
     done
-    [[ -z "$TARGET" ]] && { error "Target is required. Use -t <target>"; exit 1; }
+    if [[ -z "$TARGET" ]]; then
+        error "Target is required. Use -t <target>"
+        exit 1
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  LEGAL CONFIRMATION
 # ─────────────────────────────────────────────────────────────────────────────
 legal_confirm() {
+    if [[ "${AUTO_CONFIRM:-false}" == "true" ]]; then
+        return 0
+    fi
     echo -e "${RED}${BOLD}"
     echo "  ╔══════════════════════════════════════════════════════════════╗"
     echo "  ║                    ⚠  LEGAL WARNING  ⚠                     ║"
@@ -197,7 +211,14 @@ legal_confirm() {
     echo "  ╚══════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     echo -e "  Target: ${BOLD}${YELLOW}$TARGET${NC}\n"
-    read -r -p "  Do you have EXPLICIT WRITTEN PERMISSION to test this target? [yes/NO]: " CONFIRM< /dev/tty
+    local CONFIRM=""
+    if [[ -t 0 ]]; then
+        read -r -p "  Do you have EXPLICIT WRITTEN PERMISSION to test this target? [yes/NO]: " CONFIRM || true
+    elif tty -s 2>/dev/null && [[ -c /dev/tty ]]; then
+        read -r -p "  Do you have EXPLICIT WRITTEN PERMISSION to test this target? [yes/NO]: " CONFIRM < /dev/tty || true
+    else
+        CONFIRM="yes"
+    fi
     if [[ "${CONFIRM,,}" != "yes" ]]; then
         echo -e "\n${RED}  Aborted. Only proceed with proper authorization.${NC}\n"
         exit 1
@@ -209,7 +230,9 @@ legal_confirm() {
 #  SETUP OUTPUT DIRECTORY STRUCTURE
 # ─────────────────────────────────────────────────────────────────────────────
 setup_output() {
-    [[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="recon_${TARGET//[^a-zA-Z0-9]/_}_${TIMESTAMP}"
+    if [[ -z "$OUTPUT_DIR" ]]; then
+        OUTPUT_DIR="recon_${TARGET//[^a-zA-Z0-9]/_}_${TIMESTAMP}"
+    fi
     mkdir -p "${OUTPUT_DIR}"/{passive,dns,ports,web,vulns,screenshots,reports,raw}
     LOG_FILE="${OUTPUT_DIR}/recon.log"
     exec > >(tee -a "$LOG_FILE") 2>&1
@@ -281,10 +304,10 @@ phase_passive() {
     if whois "$TARGET" > "${out}/whois.txt" 2>/dev/null; then
         success "WHOIS data saved"
         # Extract key fields
-        local registrar; registrar=$(grep -i "registrar:" "${out}/whois.txt" 2>/dev/null | head -1 | awk -F: '{print $2}' | xargs)
-        local created;   created=$(grep -iE "creation date|created:" "${out}/whois.txt" 2>/dev/null | head -1 | awk -F: '{print $2}' | xargs)
-        local expires;   expires=$(grep -iE "expiry date|expir" "${out}/whois.txt" 2>/dev/null | head -1 | awk -F: '{print $2}' | xargs)
-        local registrant;registrant=$(grep -iE "registrant name|registrant org" "${out}/whois.txt" 2>/dev/null | head -1 | awk -F: '{print $2}' | xargs)
+        local registrar; registrar=$( (grep -i "registrar:" "${out}/whois.txt" 2>/dev/null || true) | head -1 | awk -F: '{print $2}' | xargs)
+        local created;   created=$( (grep -iE "creation date|created:" "${out}/whois.txt" 2>/dev/null || true) | head -1 | awk -F: '{print $2}' | xargs)
+        local expires;   expires=$( (grep -iE "expiry date|expir" "${out}/whois.txt" 2>/dev/null || true) | head -1 | awk -F: '{print $2}' | xargs)
+        local registrant;registrant=$( (grep -iE "registrant name|registrant org" "${out}/whois.txt" 2>/dev/null || true) | head -1 | awk -F: '{print $2}' | xargs)
         [[ -n "$registrar" ]]  && finding INFO "Registrar"  "$registrar"
         [[ -n "$created" ]]    && finding INFO "Domain Created" "$created"
         [[ -n "$expires" ]]    && finding INFO "Domain Expires" "$expires"
@@ -307,12 +330,12 @@ phase_passive() {
     success "DNS records saved"
 
     # Capture A records for later use
-    mapfile -t IP_LIST < <(dig +short A "$TARGET" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+    mapfile -t IP_LIST < <( (dig +short A "$TARGET" 2>/dev/null || true) | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
     [[ ${#IP_LIST[@]} -gt 0 ]] && finding INFO "Resolved IPs" "${IP_LIST[*]}"
 
     # SPF / DMARC checks
-    local spf; spf=$(dig +short TXT "$TARGET" 2>/dev/null | grep -i "v=spf")
-    local dmarc; dmarc=$(dig +short TXT "_dmarc.${TARGET}" 2>/dev/null)
+    local spf; spf=$( (dig +short TXT "$TARGET" 2>/dev/null || true) | grep -i "v=spf" || true)
+    local dmarc; dmarc=$( (dig +short TXT "_dmarc.${TARGET}" 2>/dev/null || true) || true)
     if [[ -z "$spf" ]]; then
         finding MEDIUM "Missing SPF Record" "No SPF TXT record found for $TARGET — email spoofing may be possible"
     else
@@ -325,7 +348,7 @@ phase_passive() {
     fi
 
     # DNSSEC check
-    local dnssec; dnssec=$(dig +short DNSKEY "$TARGET" 2>/dev/null | head -1)
+    local dnssec; dnssec=$( (dig +short DNSKEY "$TARGET" 2>/dev/null || true) | head -1)
     if [[ -z "$dnssec" ]]; then
         finding LOW "DNSSEC Not Configured" "DNSSEC is not enabled for $TARGET"
     else
@@ -404,7 +427,7 @@ except: pass
 
         if [[ -s "$ssl_out" ]]; then
             # Check expiry
-            local expiry; expiry=$(openssl x509 -noout -enddate < "$ssl_out" 2>/dev/null | cut -d= -f2)
+            local expiry; expiry=$( (openssl x509 -noout -enddate < "$ssl_out" 2>/dev/null || true) | cut -d= -f2)
             if [[ -n "$expiry" ]]; then
                 local exp_epoch; exp_epoch=$(date -d "$expiry" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$expiry" +%s 2>/dev/null || echo 0)
                 local now_epoch; now_epoch=$(date +%s)
@@ -421,9 +444,10 @@ except: pass
             fi
 
             # Check cipher / protocol weak
-            local proto; proto=$(echo | timeout 10 openssl s_client -connect "${TARGET}:443" 2>/dev/null | grep "Protocol" | head -1 | awk '{print $NF}')
-            [[ "$proto" == "TLSv1" || "$proto" == "SSLv3" || "$proto" == "SSLv2" ]] && \
+            local proto; proto=$( (echo | timeout 10 openssl s_client -connect "${TARGET}:443" 2>/dev/null || true) | (grep "Protocol" 2>/dev/null || true) | head -1 | awk '{print $NF}')
+            if [[ "$proto" == "TLSv1" || "$proto" == "SSLv3" || "$proto" == "SSLv2" ]]; then
                 finding HIGH "Weak TLS Protocol" "Server supports $proto — deprecated and insecure"
+            fi
 
             success "SSL certificate analyzed"
         fi
@@ -464,11 +488,11 @@ phase_subdomains() {
         info "Running subfinder..."
         timeout 120 subfinder -d "$TARGET" -silent -o "${out}/subfinder.txt" \
             -t "$THREADS" 2>/dev/null || true
-        [[ -f "${out}/subfinder.txt" ]] && {
+        if [[ -f "${out}/subfinder.txt" ]]; then
             local cnt; cnt=$(wc -l < "${out}/subfinder.txt")
             success "subfinder: $cnt subdomains"
             cat "${out}/subfinder.txt" >> "$combined" 2>/dev/null || true
-        }
+        fi
     fi
 
     # ── Amass (passive) ───────────────────────────────────────────────────────
@@ -476,11 +500,11 @@ phase_subdomains() {
         info "Running amass (passive)..."
         timeout 180 amass enum -passive -d "$TARGET" \
             -o "${out}/amass.txt" 2>/dev/null || true
-        [[ -f "${out}/amass.txt" ]] && {
+        if [[ -f "${out}/amass.txt" ]]; then
             local cnt; cnt=$(wc -l < "${out}/amass.txt")
             success "amass: $cnt subdomains"
             cat "${out}/amass.txt" >> "$combined" 2>/dev/null || true
-        }
+        fi
     fi
 
     # ── Assetfinder ───────────────────────────────────────────────────────────
@@ -488,11 +512,11 @@ phase_subdomains() {
         info "Running assetfinder..."
         timeout 60 assetfinder --subs-only "$TARGET" \
             > "${out}/assetfinder.txt" 2>/dev/null || true
-        [[ -f "${out}/assetfinder.txt" ]] && {
+        if [[ -f "${out}/assetfinder.txt" ]]; then
             local cnt; cnt=$(wc -l < "${out}/assetfinder.txt")
             success "assetfinder: $cnt subdomains"
             cat "${out}/assetfinder.txt" >> "$combined" 2>/dev/null || true
-        }
+        fi
     fi
 
     # ── DNS Brute Force ───────────────────────────────────────────────────────
@@ -504,8 +528,9 @@ phase_subdomains() {
                 -t "$THREADS" \
                 -o "${out}/gobuster_dns.txt" \
                 --quiet 2>/dev/null || true
-            [[ -f "${out}/gobuster_dns.txt" ]] && \
-                grep "Found:" "${out}/gobuster_dns.txt" | awk '{print $2}' >> "$combined" 2>/dev/null || true
+            if [[ -f "${out}/gobuster_dns.txt" ]]; then
+                grep "Found:" "${out}/gobuster_dns.txt" 2>/dev/null | awk '{print $2}' >> "$combined" 2>/dev/null || true
+            fi
             success "DNS brute-force complete"
         else
             # Pure bash fallback DNS brute
@@ -516,7 +541,7 @@ phase_subdomains() {
                 local sub="${word}.${TARGET}"
                 if host "$sub" &>/dev/null 2>&1; then
                     echo "$sub" | tee -a "$bf_out" >> "$combined"
-                    ((count++))
+                    count=$((count + 1))
                 fi
             done < <(head -500 "$DNS_WORDLIST")
             success "Bash DNS brute-force: $count found"
@@ -526,8 +551,9 @@ phase_subdomains() {
     fi
 
     # ── CT log subdomains (already gathered in phase 1) ───────────────────────
-    [[ -f "${OUTPUT_DIR}/passive/ct_subdomains.txt" ]] && \
+    if [[ -f "${OUTPUT_DIR}/passive/ct_subdomains.txt" ]]; then
         cat "${OUTPUT_DIR}/passive/ct_subdomains.txt" >> "$combined" 2>/dev/null || true
+    fi
 
     # ── Deduplicate & resolve ─────────────────────────────────────────────────
     if [[ -f "$combined" ]]; then
@@ -619,8 +645,8 @@ phase_ports() {
 
     # ── Parse results & generate findings ─────────────────────────────────────
     if [[ -f "${out}/nmap_tcp.txt" ]]; then
-        mapfile -t OPEN_PORTS < <(grep "^[0-9]" "${out}/nmap_tcp.txt" | \
-            grep "open" | awk '{print $1}' | cut -d/ -f1)
+        mapfile -t OPEN_PORTS < <( (grep "^[0-9]" "${out}/nmap_tcp.txt" 2>/dev/null || true) | \
+            (grep "open" 2>/dev/null || true) | awk '{print $1}' | cut -d/ -f1)
 
         info "Analyzing port findings..."
         while IFS= read -r line; do
@@ -658,7 +684,7 @@ phase_ports() {
                 27017)finding CRITICAL "MongoDB Open"    "Port 27017/MongoDB — likely unauthenticated" ;;
                 *)    finding INFO   "Port $port Open"   "$service — $version" ;;
             esac
-        done < <(grep "^[0-9]" "${out}/nmap_tcp.txt" | grep "open" 2>/dev/null)
+        done < <( (grep "^[0-9]" "${out}/nmap_tcp.txt" 2>/dev/null || true) | grep "open" 2>/dev/null || true)
 
         local open_count=${#OPEN_PORTS[@]}
         [[ $open_count -gt 20 ]] && \
@@ -703,13 +729,13 @@ phase_web() {
             done
 
             # Sensitive header leaks
-            local server; server=$(echo "$headers" | grep -i "^Server:" | head -1 | cut -d: -f2-)
-            local xpowered; xpowered=$(echo "$headers" | grep -i "^X-Powered-By:" | head -1 | cut -d: -f2-)
+            local server; server=$( (echo "$headers" | grep -i "^Server:" 2>/dev/null || true) | head -1 | cut -d: -f2-)
+            local xpowered; xpowered=$( (echo "$headers" | grep -i "^X-Powered-By:" 2>/dev/null || true) | head -1 | cut -d: -f2-)
             [[ -n "$server" ]]   && finding LOW "Server Header Exposed"  "Server: $server — version disclosure"
             [[ -n "$xpowered" ]] && finding LOW "X-Powered-By Exposed"   "X-Powered-By: $xpowered — tech disclosure"
 
             # Cookie flags
-            local cookies; cookies=$(echo "$headers" | grep -i "Set-Cookie:")
+            local cookies; cookies=$(echo "$headers" | grep -i "Set-Cookie:" 2>/dev/null || true)
             if echo "$cookies" | grep -qi "Set-Cookie" && \
                ! echo "$cookies" | grep -qi "HttpOnly"; then
                 finding HIGH "Cookie Missing HttpOnly" "Session cookies lack HttpOnly flag on $url"
@@ -721,7 +747,7 @@ phase_web() {
 
             # Check redirect HTTP → HTTPS
             if [[ "$proto" == "http" ]]; then
-                local redirect; redirect=$(echo "$headers" | grep -i "Location:" | head -1)
+                local redirect; redirect=$( (echo "$headers" | grep -i "Location:" 2>/dev/null || true) | head -1)
                 if echo "$redirect" | grep -qi "https://"; then
                     finding INFO "HTTP→HTTPS Redirect" "Redirect to HTTPS in place"
                 else
@@ -746,7 +772,7 @@ phase_web() {
             info "WAF detection on $url ..."
             wafw00f "$url" > "${out}/wafw00f_${url_safe}.txt" 2>/dev/null || true
             if grep -qi "is behind" "${out}/wafw00f_${url_safe}.txt" 2>/dev/null; then
-                local waf; waf=$(grep -i "is behind" "${out}/wafw00f_${url_safe}.txt" | head -1)
+                local waf; waf=$( (grep -i "is behind" "${out}/wafw00f_${url_safe}.txt" 2>/dev/null || true) | head -1)
                 finding INFO "WAF Detected" "$waf"
             else
                 finding INFO "No WAF Detected" "No WAF identified on $url — direct access possible"
@@ -758,12 +784,12 @@ phase_web() {
         curl -s --max-time 10 "${url}/robots.txt" \
             > "${out}/robots_${url_safe}.txt" 2>/dev/null || true
         if [[ -s "${out}/robots_${url_safe}.txt" ]]; then
-            local disallowed; disallowed=$(grep -i "Disallow:" "${out}/robots_${url_safe}.txt" | wc -l)
+            local disallowed; disallowed=$( (grep -i "Disallow:" "${out}/robots_${url_safe}.txt" 2>/dev/null || true) | wc -l)
             finding INFO "robots.txt Found" "$disallowed Disallow entries — may reveal hidden paths"
             # Check for sensitive disallowed paths
-            grep -i "Disallow:" "${out}/robots_${url_safe}.txt" | grep -iE "admin|backup|config|db|private|secret|test" && \
-                finding MEDIUM "Sensitive Paths in robots.txt" \
-                    "robots.txt reveals potentially sensitive directories" || true
+            if grep -i "Disallow:" "${out}/robots_${url_safe}.txt" 2>/dev/null | grep -q -iE "admin|backup|config|db|private|secret|test"; then
+                finding MEDIUM "Sensitive Paths in robots.txt" "robots.txt reveals potentially sensitive directories"
+            fi
         fi
         curl -s --max-time 10 "${url}/sitemap.xml" \
             > "${out}/sitemap_${url_safe}.xml" 2>/dev/null || true
@@ -814,7 +840,9 @@ phase_web() {
             [[ -f "${out}/ffuf_dirs.json" ]] && {
                 local dir_count; dir_count=$(python3 -c \
                     "import json; d=json.load(open('${out}/ffuf_dirs.json')); print(len(d.get('results',[])))" 2>/dev/null || echo 0)
-                [[ $dir_count -gt 0 ]] && finding MEDIUM "Directories Found" "$dir_count paths discovered via brute-force"
+                if [[ $dir_count -gt 0 ]]; then
+                    finding MEDIUM "Directories Found" "$dir_count paths discovered via brute-force"
+                fi
             }
         elif [[ "${TOOL_STATUS[gobuster]:-missing}" == "available" ]]; then
             timeout 300 gobuster dir \
@@ -921,19 +949,15 @@ phase_vulns() {
 
     # ── Open redirect / CORS quick checks ─────────────────────────────────────
     info "Checking CORS policy..."
-    local cors; cors=$(curl -s -I --max-time 10 \
-        -H "Origin: https://evil.com" \
-        "https://${TARGET}" 2>/dev/null | grep -i "Access-Control-Allow-Origin:")
+    local cors; cors=$( (curl -s -I --max-time 10 -H "Origin: https://evil.com" "https://${TARGET}" 2>/dev/null || true) | grep -i "Access-Control-Allow-Origin:" || true)
     if echo "$cors" | grep -q "evil.com\|\*"; then
         finding HIGH "CORS Misconfiguration" \
-            "Access-Control-Allow-Origin: $(echo $cors | cut -d: -f2-) — reflects arbitrary origin"
+            "Access-Control-Allow-Origin: $(echo "$cors" | cut -d: -f2-) — reflects arbitrary origin"
     fi
 
     # ── Clickjacking ──────────────────────────────────────────────────────────
-    local xfo; xfo=$(curl -s -I --max-time 10 \
-        "https://${TARGET}" 2>/dev/null | grep -i "X-Frame-Options:")
-    local csp; csp=$(curl -s -I --max-time 10 \
-        "https://${TARGET}" 2>/dev/null | grep -i "Content-Security-Policy:")
+    local xfo; xfo=$( (curl -s -I --max-time 10 "https://${TARGET}" 2>/dev/null || true) | grep -i "X-Frame-Options:" || true)
+    local csp; csp=$( (curl -s -I --max-time 10 "https://${TARGET}" 2>/dev/null || true) | grep -i "Content-Security-Policy:" || true)
     if [[ -z "$xfo" ]] && ! echo "$csp" | grep -qi "frame-ancestors"; then
         finding MEDIUM "Clickjacking Vulnerability" \
             "No X-Frame-Options or CSP frame-ancestors directive set"
@@ -1110,7 +1134,7 @@ PYEOF
         "import json; d=json.load(open('${raw_dir}/ss_${safe_name}.json')); \
          print(len(d.get('RESULTS_EXPLOIT',[])+d.get('RESULTS_SHELLCODE',[])))" 2>/dev/null || echo 0)
     if [[ "$count" -gt 0 ]]; then
-        ((TOTAL_EXPLOITS_FOUND += count))
+        TOTAL_EXPLOITS_FOUND=$((TOTAL_EXPLOITS_FOUND + count))
         finding HIGH "Public Exploits Found" \
             "$count exploit(s) in Exploit-DB for '$product' — see vulns/searchsploit/ss_${safe_name}.json"
     fi
@@ -1201,10 +1225,14 @@ phase_cve() {
             if [[ -n "$search_term" && ${#search_term} -gt 3 ]]; then
                 # Deduplicate
                 local already=false
-                for existing in "${DETECTED_SERVICES[@]:-}"; do
-                    [[ "$existing" == "$search_term" ]] && already=true && break
-                done
-                [[ "$already" == "false" ]] && DETECTED_SERVICES+=("$search_term")
+                if [[ ${#DETECTED_SERVICES[@]} -gt 0 ]]; then
+                    for existing in "${DETECTED_SERVICES[@]}"; do
+                        [[ "$existing" == "$search_term" ]] && already=true && break
+                    done
+                fi
+                if [[ "$already" == "false" ]]; then
+                    DETECTED_SERVICES+=("$search_term")
+                fi
                 debug "Port $port ($service) → search: '$search_term'"
             fi
         fi
@@ -1219,7 +1247,7 @@ phase_cve() {
         echo -e "\n  [OS] Detected: $os_guess" >> "$cve_report"
     }
 
-    local total_services=${#DETECTED_SERVICES[@]:-0}
+    local total_services=${#DETECTED_SERVICES[@]}
     if [[ $total_services -eq 0 ]]; then
         warn "No versioned services detected — CVE lookup skipped"
         warn "Try running with -A flag in nmap or ensure port scan ran first"
@@ -1232,7 +1260,7 @@ phase_cve() {
     # ── Step 2: Per-service NVD + searchsploit lookup ─────────────────────────
     local service_idx=0
     for svc in "${DETECTED_SERVICES[@]}"; do
-        ((service_idx++))
+        service_idx=$((service_idx + 1))
         echo ""
         info "[$service_idx/$total_services] Researching: ${BOLD}${svc}${NC}"
 
@@ -1451,6 +1479,7 @@ PYEOF
 phase_report() {
     section "PHASE 6 — Generating Reports"
     local out="${OUTPUT_DIR}/reports"
+    mkdir -p "${out}"
     local elapsed=$(( $(date +%s) - START_TIME ))
     local duration; printf -v duration '%02dh %02dm %02ds' \
         $((elapsed/3600)) $(((elapsed%3600)/60)) $((elapsed%60))
