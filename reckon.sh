@@ -655,7 +655,7 @@ phase_ports() {
             local port; port=$(echo "$line" | awk '{print $1}' | cut -d/ -f1)
             local state; state=$(echo "$line" | awk '{print $2}')
             local service; service=$(echo "$line" | awk '{print $3}')
-            local version; version=$(echo "$line" | cut -d' ' -f4-)
+            local version; version=$(echo "$line" | awk '{$1=$2=$3=""; print $0}' | sed 's/^[[:space:]]*//')
 
             if [[ "$state" != "open" ]]; then
                 continue
@@ -993,7 +993,7 @@ nvd_search() {
         "${api_url}?keywordSearch=${encoded_kw}&resultsPerPage=${max_results}")
     [[ -n "$NVD_API_KEY" ]] && curl_args+=(-H "apiKey: ${NVD_API_KEY}")
 
-    local raw; raw=$(curl "${curl_args[@]}" 2>/dev/null)
+    local raw; raw=$(curl "${curl_args[@]}" 2>/dev/null || true)
     echo "$raw"
 }
 
@@ -1003,14 +1003,13 @@ parse_nvd_response() {
     local raw_json="$2"
     local out_file="$3"
 
-    python3 - <<PYEOF >> "$out_file" 2>/dev/null
+    printf '%s' "$raw_json" | python3 - "$product" <<'PYEOF' >> "$out_file" 2>/dev/null
 import json, sys
 
-product = """${product}"""
-raw = """${raw_json//\"/\\\"}"""
+product = sys.argv[1]
 
 try:
-    data = json.loads(raw)
+    data = json.load(sys.stdin)
 except Exception as e:
     print(f"  [!] JSON parse error for {product}: {e}")
     sys.exit(0)
@@ -1079,18 +1078,19 @@ run_searchsploit() {
 
     info "  searchsploit → $product"
     # --json gives structured output; -w adds URLs
-    local ss_json; ss_json=$(searchsploit --json -w "$product" 2>/dev/null)
+    local ss_json; ss_json=$(searchsploit --json -w "$product" 2>/dev/null || true)
     echo "$ss_json" > "${raw_dir}/ss_${safe_name}.json"
 
-    python3 - <<PYEOF | tee -a "$out_file"
+    python3 - "$product" "${raw_dir}/ss_${safe_name}.json" <<'PYEOF' | tee -a "$out_file"
 import json, sys, os
 
-product = """${product}"""
-raw = open("${raw_dir}/ss_${safe_name}.json").read()
+product = sys.argv[1]
+raw_path = sys.argv[2]
 
 try:
-    data = json.loads(raw)
-except:
+    with open(raw_path, encoding='utf-8', errors='ignore') as f:
+        data = json.load(f)
+except Exception:
     print(f"  [!] searchsploit returned no JSON for {product}")
     sys.exit(0)
 
@@ -1183,7 +1183,7 @@ phase_cve() {
         if echo "$line" | grep -qE "^[0-9]+/tcp.*open"; then
             local port;    port=$(echo    "$line" | awk '{print $1}' | cut -d/ -f1)
             local service; service=$(echo "$line" | awk '{print $3}')
-            local version; version=$(echo "$line" | cut -d' ' -f4- | sed 's/^[[:space:]]*//')
+            local version; version=$(echo "$line" | awk '{$1=$2=$3=""; print $0}' | sed 's/^[[:space:]]*//')
 
             # Skip empty or generic versions
             [[ -z "$version" || "$version" == *"?"* ]] && continue
@@ -1191,44 +1191,59 @@ phase_cve() {
             # Build clean product+version string for searches
             local search_term=""
             case "$service" in
-                http|https|http-proxy)
+                http|https|http-proxy|ssl/http|ssl/https)
                     # Extract "Apache 2.4.49" or "nginx 1.18.0" etc.
                     if echo "$version" | grep -qiE "Apache|nginx|IIS|lighttpd|Tomcat|Jetty|Caddy|Cherokee"; then
-                        search_term=$(echo "$version" | grep -oiE "(Apache|nginx|IIS|lighttpd|Tomcat|Jetty|Caddy|Cherokee)[^(,;]*" | head -1 | sed 's/[[:space:]]*$//')
+                        search_term=$(echo "$version" | grep -oiE "(Apache|nginx|IIS|lighttpd|Tomcat|Jetty|Caddy|Cherokee)[^(,;]*" | head -1 | sed 's/[[:space:]]*$//' || true)
+                    else
+                        local first_word; first_word=$(echo "$version" | awk '{print $1}')
+                        local ver_num;    ver_num=$(echo "$version" | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | head -1 || true)
+                        if [[ -n "$first_word" && ${#first_word} -gt 2 ]]; then
+                            if [[ -n "$ver_num" ]]; then
+                                search_term="${first_word} ${ver_num}"
+                            else
+                                search_term="${first_word}"
+                            fi
+                        fi
                     fi ;;
                 ssh)
-                    search_term=$(echo "$version" | grep -oiE "OpenSSH [0-9]+\.[0-9p]+" | head -1) ;;
+                    search_term=$(echo "$version" | grep -oiE "OpenSSH [0-9]+\.[0-9p]+" | head -1 || true) ;;
                 ftp)
-                    search_term=$(echo "$version" | grep -oiE "(vsftpd|ProFTPD|Pure-FTPd|FileZilla)[^(,;]*" | head -1 | sed 's/[[:space:]]*$//') ;;
+                    search_term=$(echo "$version" | grep -oiE "(vsftpd|ProFTPD|Pure-FTPd|FileZilla)[^(,;]*" | head -1 | sed 's/[[:space:]]*$//' || true) ;;
                 smtp|smtps)
-                    search_term=$(echo "$version" | grep -oiE "(Postfix|Sendmail|Exim|Exchange)[^(,;]*" | head -1 | sed 's/[[:space:]]*$//') ;;
+                    search_term=$(echo "$version" | grep -oiE "(Postfix|Sendmail|Exim|Exchange)[^(,;]*" | head -1 | sed 's/[[:space:]]*$//' || true) ;;
                 mysql|mariadb)
-                    search_term=$(echo "$version" | grep -oiE "(MySQL|MariaDB) [0-9]+\.[0-9.]+" | head -1) ;;
+                    search_term=$(echo "$version" | grep -oiE "(MySQL|MariaDB) [0-9]+\.[0-9.]+" | head -1 || true) ;;
                 ms-sql-s|mssql)
-                    search_term=$(echo "$version" | grep -oiE "Microsoft SQL Server [0-9]+" | head -1) ;;
+                    search_term=$(echo "$version" | grep -oiE "Microsoft SQL Server [0-9]+" | head -1 || true) ;;
                 rdp|ms-wbt-server)
                     search_term="Windows RDP" ;;
                 smb|netbios-ssn|microsoft-ds)
-                    search_term=$(echo "$version" | grep -oiE "Samba [0-9]+\.[0-9.]+" | head -1)
+                    search_term=$(echo "$version" | grep -oiE "Samba [0-9]+\.[0-9.]+" | head -1 || true)
                     [[ -z "$search_term" ]] && search_term="SMB Windows" ;;
                 vnc)
                     search_term="VNC RealVNC" ;;
                 telnet)
                     search_term="telnet" ;;
                 redis)
-                    search_term=$(echo "$version" | grep -oiE "Redis [0-9]+\.[0-9.]+" | head -1)
+                    search_term=$(echo "$version" | grep -oiE "Redis [0-9]+\.[0-9.]+" | head -1 || true)
                     [[ -z "$search_term" ]] && search_term="Redis" ;;
                 mongodb)
-                    search_term=$(echo "$version" | grep -oiE "MongoDB [0-9]+\.[0-9.]+" | head -1)
+                    search_term=$(echo "$version" | grep -oiE "MongoDB [0-9]+\.[0-9.]+" | head -1 || true)
                     [[ -z "$search_term" ]] && search_term="MongoDB" ;;
                 postgresql)
-                    search_term=$(echo "$version" | grep -oiE "PostgreSQL [0-9]+\.[0-9.]+" | head -1) ;;
+                    search_term=$(echo "$version" | grep -oiE "PostgreSQL [0-9]+\.[0-9.]+" | head -1 || true) ;;
                 *)
                     # Generic: use first meaningful word + version number if present
                     local first_word; first_word=$(echo "$version" | awk '{print $1}')
-                    local ver_num;    ver_num=$(echo "$version" | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | head -1)
-                    [[ -n "$first_word" && ${#first_word} -gt 2 ]] && \
-                        search_term="${first_word} ${ver_num}" ;;
+                    local ver_num;    ver_num=$(echo "$version" | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | head -1 || true)
+                    if [[ -n "$first_word" && ${#first_word} -gt 2 ]]; then
+                        if [[ -n "$ver_num" ]]; then
+                            search_term="${first_word} ${ver_num}"
+                        else
+                            search_term="${first_word}"
+                        fi
+                    fi ;;
             esac
 
             # Clean up and store unique entries
@@ -1251,12 +1266,12 @@ phase_cve() {
 
     # Also add nmap OS detection result if available
     local os_guess; os_guess=$(grep -i "OS details\|Running:" "${OUTPUT_DIR}/ports/nmap_tcp.txt" \
-        2>/dev/null | head -2 | awk -F: '{print $2}' | xargs)
-    [[ -n "$os_guess" ]] && {
+        2>/dev/null | head -2 | awk -F: '{print $2}' | xargs || true)
+    if [[ -n "$os_guess" ]]; then
         info "OS detected: $os_guess"
         finding INFO "OS Fingerprint" "$os_guess"
         echo -e "\n  [OS] Detected: $os_guess" >> "$cve_report"
-    }
+    fi
 
     local total_services=${#DETECTED_SERVICES[@]}
     if [[ $total_services -eq 0 ]]; then
@@ -1281,7 +1296,7 @@ phase_cve() {
 
         # ── 2a: NVD CVE API lookup ───────────────────────────────────────────
         info "  Querying NVD CVE database..."
-        local nvd_raw; nvd_raw=$(nvd_search "$svc" 15)
+        local nvd_raw; nvd_raw=$(nvd_search "$svc" 15 || true)
 
         if [[ -n "$nvd_raw" ]]; then
             # Save raw JSON
@@ -1294,35 +1309,43 @@ phase_cve() {
             local crit_count high_count med_count
             crit_count=$(echo "$nvd_raw" | python3 -c "
 import json,sys
-d=json.load(sys.stdin)
-vulns=d.get('vulnerabilities',[])
-def score(v):
-    m=v.get('cve',{}).get('metrics',{})
-    for k in ['cvssMetricV31','cvssMetricV30','cvssMetricV2']:
-        arr=m.get(k,[])
-        if arr: return float(arr[0].get('cvssData',{}).get('baseScore',0))
-    return 0
-print(sum(1 for v in vulns if score(v)>=9.0))
+try:
+    d=json.load(sys.stdin)
+    vulns=d.get('vulnerabilities',[])
+    def score(v):
+        m=v.get('cve',{}).get('metrics',{})
+        for k in ['cvssMetricV31','cvssMetricV30','cvssMetricV2']:
+            arr=m.get(k,[])
+            if arr: return float(arr[0].get('cvssData',{}).get('baseScore',0))
+        return 0
+    print(sum(1 for v in vulns if score(v)>=9.0))
+except Exception:
+    print(0)
 " 2>/dev/null || echo 0)
             high_count=$(echo "$nvd_raw" | python3 -c "
 import json,sys
-d=json.load(sys.stdin)
-vulns=d.get('vulnerabilities',[])
-def score(v):
-    m=v.get('cve',{}).get('metrics',{})
-    for k in ['cvssMetricV31','cvssMetricV30','cvssMetricV2']:
-        arr=m.get(k,[])
-        if arr: return float(arr[0].get('cvssData',{}).get('baseScore',0))
-    return 0
-print(sum(1 for v in vulns if 7.0<=score(v)<9.0))
+try:
+    d=json.load(sys.stdin)
+    vulns=d.get('vulnerabilities',[])
+    def score(v):
+        m=v.get('cve',{}).get('metrics',{})
+        for k in ['cvssMetricV31','cvssMetricV30','cvssMetricV2']:
+            arr=m.get(k,[])
+            if arr: return float(arr[0].get('cvssData',{}).get('baseScore',0))
+        return 0
+    print(sum(1 for v in vulns if 7.0<=score(v)<9.0))
+except Exception:
+    print(0)
 " 2>/dev/null || echo 0)
 
-            [[ "$crit_count" -gt 0 ]] && \
+            if [[ "$crit_count" -gt 0 ]]; then
                 finding CRITICAL "NVD CVEs for $svc" \
                     "$crit_count CRITICAL-score CVEs (CVSS≥9.0) found in NVD database"
-            [[ "$high_count" -gt 0 ]] && \
+            fi
+            if [[ "$high_count" -gt 0 ]]; then
                 finding HIGH "NVD CVEs for $svc" \
                     "$high_count HIGH-score CVEs (CVSS 7.0–8.9) found in NVD database"
+            fi
         else
             warn "  NVD API returned no data for '$svc' (rate limit or network issue)"
             echo "  [!] NVD API returned no data for $svc" >> "$cve_report"
@@ -1361,7 +1384,7 @@ print(sum(1 for v in vulns if 7.0<=score(v)<9.0))
                     if echo "$tech_line" | grep -qi "$tech"; then
                         local ver; ver=$(echo "$tech_line" | \
                             grep -oiE "${tech}[^,\]]*" | head -1 | \
-                            grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | head -1)
+                            grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | head -1 || true)
                         local tech_search="$tech"
                         [[ -n "$ver" ]] && tech_search="$tech $ver"
                         web_techs+=("$tech_search")
@@ -1371,9 +1394,11 @@ print(sum(1 for v in vulns if 7.0<=score(v)<9.0))
         done
 
         # Deduplicate web techs
-        mapfile -t web_techs < <(printf '%s\n' "${web_techs[@]}" | sort -u)
+        if [[ ${#web_techs[@]} -gt 0 ]]; then
+            mapfile -t web_techs < <(printf '%s\n' "${web_techs[@]}" | sort -u)
+        fi
 
-        for wt in "${web_techs[@]}"; do
+        for wt in "${web_techs[@]:-}"; do
             [[ -z "$wt" ]] && continue
             info "  searchsploit → $wt (web tech)"
             run_searchsploit "$wt" "$cve_report"
@@ -1382,21 +1407,27 @@ print(sum(1 for v in vulns if 7.0<=score(v)<9.0))
 
         # Always run a broad sweep for common things
         local broad_terms=()
-        grep -qiE "wordpress|wp-content" "${OUTPUT_DIR}/web/"*.txt 2>/dev/null && \
+        if grep -qiE "wordpress|wp-content" "${OUTPUT_DIR}/web/"*.txt 2>/dev/null; then
             broad_terms+=("WordPress")
-        grep -qi "drupal" "${OUTPUT_DIR}/web/"*.txt 2>/dev/null && \
+        fi
+        if grep -qi "drupal" "${OUTPUT_DIR}/web/"*.txt 2>/dev/null; then
             broad_terms+=("Drupal")
-        grep -qi "joomla" "${OUTPUT_DIR}/web/"*.txt 2>/dev/null && \
+        fi
+        if grep -qi "joomla" "${OUTPUT_DIR}/web/"*.txt 2>/dev/null; then
             broad_terms+=("Joomla")
-        grep -qi "struts" "${OUTPUT_DIR}/ports/nmap_tcp.txt" 2>/dev/null && \
+        fi
+        if grep -qi "struts" "${OUTPUT_DIR}/ports/nmap_tcp.txt" 2>/dev/null; then
             broad_terms+=("Apache Struts")
+        fi
 
         for bt in "${broad_terms[@]}"; do
             # Only search if not already done
             local already_done=false
-            for done_svc in "${DETECTED_SERVICES[@]:-}"; do
-                [[ "${done_svc,,}" == *"${bt,,}"* ]] && already_done=true && break
-            done
+            if [[ ${#DETECTED_SERVICES[@]} -gt 0 ]]; then
+                for done_svc in "${DETECTED_SERVICES[@]}"; do
+                    [[ "${done_svc,,}" == *"${bt,,}"* ]] && already_done=true && break
+                done
+            fi
             if [[ "$already_done" == "false" ]]; then
                 run_searchsploit "$bt" "$cve_report"
                 sleep 1
@@ -1479,9 +1510,10 @@ PYEOF
     fi
 
     success "CVE report saved: ${cve_report}"
-    [[ $TOTAL_EXPLOITS_FOUND -gt 0 ]] && \
+    if [[ $TOTAL_EXPLOITS_FOUND -gt 0 ]]; then
         finding CRITICAL "Exploitable Services Detected" \
             "$TOTAL_EXPLOITS_FOUND public exploit(s) found across all detected services — IMMEDIATE review required"
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1497,9 +1529,15 @@ phase_report() {
 
     # ── JSON Report ───────────────────────────────────────────────────────────
     if [[ "$REPORT_FORMAT" == "json" || "$REPORT_FORMAT" == "both" ]]; then
+        export JSON_FINDINGS
         python3 - <<PYEOF > "${out}/report.json"
-import json, datetime
-findings = ${JSON_FINDINGS}
+import json, datetime, os
+
+try:
+    findings = json.loads(os.environ.get("JSON_FINDINGS", "[]"))
+except Exception:
+    findings = []
+
 report = {
     "meta": {
         "tool": "Ultimate Recon Tool v${VERSION}",
@@ -1531,9 +1569,15 @@ PYEOF
         # Build findings rows
         local findings_rows=""
         # Re-parse JSON findings for HTML
+        export JSON_FINDINGS
         findings_rows=$(python3 - <<PYEOF 2>/dev/null
-import json
-findings = ${JSON_FINDINGS}
+import json, os
+
+try:
+    findings = json.loads(os.environ.get("JSON_FINDINGS", "[]"))
+except Exception:
+    findings = []
+
 rows = []
 color_map = {
     "CRITICAL": "#dc2626",
