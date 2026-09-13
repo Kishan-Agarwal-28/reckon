@@ -994,22 +994,24 @@ nvd_search() {
     [[ -n "$NVD_API_KEY" ]] && curl_args+=(-H "apiKey: ${NVD_API_KEY}")
 
     local raw; raw=$(curl "${curl_args[@]}" 2>/dev/null || true)
-    echo "$raw"
+    printf '%s' "$raw"
 }
 
 # ── Helper: parse NVD response → pretty table + JSON accumulation ─────────────
 parse_nvd_response() {
     local product="$1"
-    local raw_json="$2"
+    local json_file="$2"
     local out_file="$3"
 
-    printf '%s' "$raw_json" | python3 - "$product" <<'PYEOF' >> "$out_file" 2>/dev/null
+    python3 - "$product" "$json_file" <<'PYEOF' | tee -a "$out_file"
 import json, sys
 
 product = sys.argv[1]
+json_file = sys.argv[2]
 
 try:
-    data = json.load(sys.stdin)
+    with open(json_file, encoding='utf-8', errors='ignore') as f:
+        data = json.load(f)
 except Exception as e:
     print(f"  [!] JSON parse error for {product}: {e}")
     sys.exit(0)
@@ -1298,45 +1300,36 @@ phase_cve() {
         info "  Querying NVD CVE database..."
         local nvd_raw; nvd_raw=$(nvd_search "$svc" 15 || true)
 
-        if [[ -n "$nvd_raw" ]]; then
-            # Save raw JSON
-            echo "$nvd_raw" > "${out}/searchsploit/nvd_${svc//[^a-zA-Z0-9]/_}.json"
+        if [[ -n "$nvd_raw" && "$nvd_raw" == *"vulnerabilities"* ]]; then
+            local nvd_file="${out}/searchsploit/nvd_${svc//[^a-zA-Z0-9]/_}.json"
+            echo "$nvd_raw" > "$nvd_file"
 
             # Parse and display
-            parse_nvd_response "$svc" "$nvd_raw" "$cve_report"
+            parse_nvd_response "$svc" "$nvd_file" "$cve_report"
 
             # Extract counts by severity for findings
-            local crit_count high_count med_count
-            crit_count=$(echo "$nvd_raw" | python3 -c "
-import json,sys
+            local counts crit_count high_count
+            counts=$(python3 - "$nvd_file" <<'PYEOF' 2>/dev/null || echo "0 0"
+import json, sys
 try:
-    d=json.load(sys.stdin)
-    vulns=d.get('vulnerabilities',[])
+    with open(sys.argv[1], encoding='utf-8', errors='ignore') as f:
+        d = json.load(f)
+    vulns = d.get('vulnerabilities', [])
     def score(v):
-        m=v.get('cve',{}).get('metrics',{})
-        for k in ['cvssMetricV31','cvssMetricV30','cvssMetricV2']:
-            arr=m.get(k,[])
-            if arr: return float(arr[0].get('cvssData',{}).get('baseScore',0))
+        m = v.get('cve', {}).get('metrics', {})
+        for k in ['cvssMetricV31', 'cvssMetricV30', 'cvssMetricV2']:
+            arr = m.get(k, [])
+            if arr: return float(arr[0].get('cvssData', {}).get('baseScore', 0))
         return 0
-    print(sum(1 for v in vulns if score(v)>=9.0))
+    c = sum(1 for v in vulns if score(v) >= 9.0)
+    h = sum(1 for v in vulns if 7.0 <= score(v) < 9.0)
+    print(f"{c} {h}")
 except Exception:
-    print(0)
-" 2>/dev/null || echo 0)
-            high_count=$(echo "$nvd_raw" | python3 -c "
-import json,sys
-try:
-    d=json.load(sys.stdin)
-    vulns=d.get('vulnerabilities',[])
-    def score(v):
-        m=v.get('cve',{}).get('metrics',{})
-        for k in ['cvssMetricV31','cvssMetricV30','cvssMetricV2']:
-            arr=m.get(k,[])
-            if arr: return float(arr[0].get('cvssData',{}).get('baseScore',0))
-        return 0
-    print(sum(1 for v in vulns if 7.0<=score(v)<9.0))
-except Exception:
-    print(0)
-" 2>/dev/null || echo 0)
+    print("0 0")
+PYEOF
+)
+            crit_count=$(echo "$counts" | awk '{print $1}')
+            high_count=$(echo "$counts" | awk '{print $2}')
 
             if [[ "$crit_count" -gt 0 ]]; then
                 finding CRITICAL "NVD CVEs for $svc" \
