@@ -729,10 +729,14 @@ phase_web() {
             done
 
             # Sensitive header leaks
-            local server; server=$( (echo "$headers" | grep -i "^Server:" 2>/dev/null || true) | head -1 | cut -d: -f2-)
-            local xpowered; xpowered=$( (echo "$headers" | grep -i "^X-Powered-By:" 2>/dev/null || true) | head -1 | cut -d: -f2-)
-            [[ -n "$server" ]]   && finding LOW "Server Header Exposed"  "Server: $server — version disclosure"
-            [[ -n "$xpowered" ]] && finding LOW "X-Powered-By Exposed"   "X-Powered-By: $xpowered — tech disclosure"
+            local server; server=$( (echo "$headers" | grep -i "^Server:" 2>/dev/null || true) | head -1 | cut -d: -f2- | xargs || true)
+            local xpowered; xpowered=$( (echo "$headers" | grep -i "^X-Powered-By:" 2>/dev/null || true) | head -1 | cut -d: -f2- | xargs || true)
+            if [[ -n "$server" ]]; then
+                finding LOW "Server Header Exposed" "Server: $server — version disclosure"
+            fi
+            if [[ -n "$xpowered" ]]; then
+                finding LOW "X-Powered-By Exposed" "X-Powered-By: $xpowered — tech disclosure"
+            fi
 
             # Cookie flags
             local cookies; cookies=$(echo "$headers" | grep -i "Set-Cookie:" 2>/dev/null || true)
@@ -793,8 +797,9 @@ phase_web() {
         fi
         curl -s --max-time 10 "${url}/sitemap.xml" \
             > "${out}/sitemap_${url_safe}.xml" 2>/dev/null || true
-        [[ -s "${out}/sitemap_${url_safe}.xml" ]] && \
+        if [[ -s "${out}/sitemap_${url_safe}.xml" ]]; then
             finding INFO "sitemap.xml Found" "Sitemap available — useful for crawling"
+        fi
 
         # ── Sensitive file checks ─────────────────────────────────────────────
         info "Checking for sensitive files..."
@@ -821,7 +826,7 @@ phase_web() {
                         finding MEDIUM "Interesting File Found" "${url}/${file} returns HTTP $code" ;;
                 esac
             fi
-        done
+        done || true
 
     done  # end for url
 
